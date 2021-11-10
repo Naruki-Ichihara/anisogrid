@@ -1,0 +1,10 @@
+version: '3.9'
+services:
+  anisogrid:
+    restart: always
+    image: ichiharanaruki/scientifictoolset:base
+    container_name: 'anisogrid'
+    working_dir: '/root/'
+    tty: true
+    volumes:
+    - ../:/workdir
