@@ -1,7 +1,6 @@
 #!opt/conda/envs/project/bin/python
 # -*- coding: utf-8 -*-
-"""Topology and material orientation optimization tool set."""
-
+"""Part of anisogrid. The toolkit for the anisotropic topology optimization"""
 from fenics import *
 from fenics_adjoint import *
 import numpy as np
@@ -58,24 +57,23 @@ def helmholtz_filter(u, U, r=0.025):
     solve(a==L, vh)
     return project(vh, U)
 
-def heviside_filter(u, U, offset=0.01):
+def heviside_filter(u, U, a=3):
     """# heviside_filter
     
-    Apply the heviside function
+    Apply the heviside function (approximate with sigmoid function)
 
     Args:
         u (fenics.function): target function
         U (fenics.FunctionSpace): Functionspace of target function
-        offset (float): base line
+        a (float): coefficient. a>50 -> Step. a=3 -> S-shape
 
     Returns:
         v (fenics.function): filterd function
 
     Note:
-        TODO: Using Regularlized Heaviside function
     
     """
-    return project((1-offset)*u/2 + (1+offset)/2, U)
+    return project(1 / (1 + exp(-a*u)), U)
 
 def rotated_lamina_stiffness_inplane(E1, E2, G12, nu12, theta):
     """# rotated_lamina_stiffness_inplane
@@ -262,9 +260,8 @@ class CoreProcess(torch_fenics.FEniCSModule):
         normrized_orient = project(as_vector((cos(theta), sin(theta))), Orient)
         normrized_orient.rename('NormalizedVectorField', 'label')
 
-        offset = 0.01
         Density = FunctionSpace(self.mesh, 'CG', 1)
-        density = heviside_filter(helmholtz_filter(r, Density), Density, offset=offset)
+        density = heviside_filter(helmholtz_filter(r, Density), Density)
         density.rename('Relatively density field', 'label')
 
         V = VectorFunctionSpace(self.mesh, 'CG', 1)
@@ -279,7 +276,8 @@ class CoreProcess(torch_fenics.FEniCSModule):
             self.material_parameters['nu12'],
             theta
         )
-        Q_reduce = Q*density
+        p = 3
+        Q_reduce = Q*density**p
 
         bcs = []
         for i in range(len(self.displacement_boundaries_sub0)):
@@ -401,11 +399,39 @@ class Optimizer():
         return cost
 
     def set_mesh(self, mesh):
+        """# set_mesh
+
+        Setting the geometry.
+
+        Args:
+            mesh: FEniCS mesh instance.
+
+        Returns:
+            None
+        """
         self.mesh = mesh
         self.count_vertices = mesh.num_vertices()
         pass
 
     def set_bcs(self, boundaries_sub0, boundaries_sub1, applied_displacements_sub0, applied_displacements_sub1):
+        """# set_bcs
+
+        Apply displacement boundaries.
+
+        Args:
+            boundaries_sub0: list(FEniCS Subdomain instance for the x-axis constraints.)
+
+                            class Clamp(SubDomain):
+                                def inside(self, x, on_boundary):
+                                    return x[1] < 0 and on_boundary
+
+            boundaries_sub1: list(FEniCS Subdomain instance for the x-axis constraints.)
+            applied_displacements_sub0: list(FEniCS constant instace.)
+            applied_displacements_sub1: list(FEniCS constant instace.)
+
+        Returns:
+            None
+        """
         self.bcs_0 = boundaries_sub0
         self.bcs_1 = boundaries_sub1
         self.applied_displacements_0 = applied_displacements_sub0
@@ -413,23 +439,77 @@ class Optimizer():
         pass
 
     def set_loading(self, boundaries, applied_load):
+        """# set_loading
+
+        Apply loading boundaries.
+
+        Args:
+            boundaries: FEniCS Subdomain instance for loading boundaries.
+
+                            class Loading(SubDomain):
+                                def inside(self, x, on_boundary):
+                                    return x[1] < 0 and on_boundary
+
+            applied_load: list(FEniCS constant vector instace.)
+
+        Returns:
+            None
+        """
         self.load_conditions = boundaries
         self.applied_loadvectors = applied_load
         pass
 
-    def set_material(self, materials):
-        self.material_parameters = materials
+    def set_material(self, material):
+        """# set_material
+
+        Orhogonal anisotropic property was assumed.
+
+        Args:
+            material: material = {'E1': 3600, 'E2': 600, 'nu12':0.45, 'G12': 500}
+            
+        Returns:
+            None
+        """
+        self.material_parameters = material
         pass
 
     def set_working_dir(self, files):
+        """# set_working_dir
+
+        Args:
+            files: path = 'results/implant_SOLID/'
+                   files = {'Displacement': XDMFFile('{}displacement.xdmf'.format(path)),      
+                            'Stress': XDMFFile('{}stress.xdmf'.format(path)),
+                            'Strain': XDMFFile('{}strain.xdmf'.format(path)),
+                            'Orient': XDMFFile('{}orient.xdmf'.format(path)),
+                            'Orientpipe': File('{}orient.xml'.format(path)),
+                            'Denspipe': File('{}dens.xml'.format(path)),
+                            'Dens': XDMFFile('{}dens.xdmf'.format(path))
+        }
+            
+        Returns:
+            None
+        """
         self.files = files
         pass
 
     def set_target(self, target):
+        """# set_target
+
+        Target volume reduction. If this value set to be >1, material density will not update.
+
+        Args: target: float
+        
+        Returns:
+            None
+        
+        """
         self.target = target
         pass
 
     def initialize(self):
+        """# Intialize
+        """
         self.problem = CoreProcess(self.mesh,
                                    self.load_conditions,
                                    self.applied_loadvectors,
@@ -441,29 +521,18 @@ class Optimizer():
                                    self.files)
         pass
 
-    def run(self, x0):
+    def run(self, x0, max_itr=100):
+        """# run
+        """
         constraint = VolumeConstraint(RelativelyDensityResponce(self.mesh))
         solver = nl.opt(nl.LD_MMA, self.count_vertices*3)
         solver.set_min_objective(self.__template)
         solver.add_inequality_constraint(lambda x, grad: constraint.template(x, grad, self.target), 1e-8)
+        #solver.set_min_objective(self.__template, None)
         solver.set_lower_bounds(-1.0)
         solver.set_upper_bounds(1.0)
         solver.set_xtol_rel(1e-10)
         solver.set_param('verbosity', 2)
-        solver.set_maxeval(100)
+        solver.set_maxeval(max_itr)
         x = solver.optimize(x0)
         pass
-
-        
-
-    
-        
-
-
-
-
-
-
-
-        
-
