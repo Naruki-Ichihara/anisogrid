@@ -57,7 +57,7 @@ def helmholtz_filter(u, U, r=0.025):
     solve(a==L, vh)
     return project(vh, U)
 
-def heviside_filter(u, U, a=3):
+def heviside_filter(u, U, a=50):
     """# heviside_filter
     
     Apply the heviside function (approximate with sigmoid function)
@@ -217,7 +217,7 @@ class CoreProcess(torch_fenics.FEniCSModule):
         files (dict{'str'}): File paths for saving some results.
     
     """
-    def __init__(self, mesh, load_conditions, applied_load_vectors, displacement_boundaries_sub0, displacement_boundaries_sub1, applied_displacements_sub0, applied_displacements_sub1, material_parameters, files):
+    def __init__(self, mesh, load_conditions, applied_load_vectors, displacement_boundaries_sub0, displacement_boundaries_sub1, applied_displacements_sub0, applied_displacements_sub1, material_parameters, files, a):
         super().__init__()
         self.mesh = mesh
         self.load_conditions = load_conditions
@@ -228,6 +228,7 @@ class CoreProcess(torch_fenics.FEniCSModule):
         self.applied_displacements_sub1 = applied_displacements_sub1
         self.material_parameters = material_parameters
         self.files = files
+        self.a = a
     
     def input_templates(self):
         return Function(FunctionSpace(self.mesh, 'CG', 1)), Function(FunctionSpace(self.mesh, 'CG', 1)), Function(FunctionSpace(self.mesh, 'CG', 1))
@@ -261,7 +262,7 @@ class CoreProcess(torch_fenics.FEniCSModule):
         normrized_orient.rename('NormalizedVectorField', 'label')
 
         Density = FunctionSpace(self.mesh, 'CG', 1)
-        density = heviside_filter(helmholtz_filter(r, Density), Density)
+        density = heviside_filter(helmholtz_filter(r, Density), Density, a=self.a)
         density.rename('Relatively density field', 'label')
 
         V = VectorFunctionSpace(self.mesh, 'CG', 1)
@@ -493,18 +494,20 @@ class Optimizer():
         self.files = files
         pass
 
-    def set_target(self, target):
+    def set_target(self, target, coffSigmoid=50):
         """# set_target
 
         Target volume reduction. If this value set to be >1, material density will not update.
 
         Args: target: float
+        coffSigmoid (float): coefficient. >50 -> Step. =3 -> S-shape
         
         Returns:
             None
         
         """
         self.target = target
+        self.a = coffSigmoid
         pass
 
     def initialize(self):
@@ -518,7 +521,8 @@ class Optimizer():
                                    self.applied_displacements_0,
                                    self.applied_displacements_1,
                                    self.material_parameters,
-                                   self.files)
+                                   self.files,
+                                   self.a)
         pass
 
     def run(self, x0, max_itr=100):
