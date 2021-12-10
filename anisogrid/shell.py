@@ -1,6 +1,9 @@
 #!opt/conda/envs/project/bin/python
 # -*- coding: utf-8 -*-
 """Part of anisogrid. The toolkit for the anisotropic topology optimization"""
+from ufl.core.ufl_type import determine_num_ops
+from ufl.functionspace import MixedFunctionSpace
+from fenics_shells import *
 from fenics import *
 from fenics_adjoint import *
 import numpy as np
@@ -8,6 +11,21 @@ from ufl import operators, transpose
 from torch_fenics import *
 import torch
 import nlopt as nl
+from tqdm import tqdm
+
+class CustomSolver(NewtonSolver):
+    def __init__(self):
+        NewtonSolver.__init__(self,
+                              PETScKrylovSolver(), PETScFactory.instance())
+
+    def solver_setup(self, A, P, problem, iteration):
+        self.linear_solver().set_operator(A)
+
+        PETScOptions.set("ksp_type", "mumps")
+        PETScOptions.set("ksp_monitor")
+        PETScOptions.set("pc_type", "ilu")
+
+        self.linear_solver().set_from_options()
 
 def iso_filter(z, e):
     """# iso_filter
@@ -57,7 +75,7 @@ def helmholtz_filter(u, U, r=0.025):
     solve(a==L, vh)
     return project(vh, U)
 
-def heviside_filter(u, U, a=50, offset=0.3):
+def heviside_filter(u, U, a=50, offset=0.5):
     """# heviside_filter
     
     Apply the heviside function (approximate with sigmoid function)
@@ -73,135 +91,8 @@ def heviside_filter(u, U, a=50, offset=0.3):
     Note:
     
     """
-    return project((1 / (1 + exp(-a*u)))*(1-offset) + offset, U)
-
-def rotated_lamina_stiffness_inplane(E1, E2, G12, nu12, theta):
-    """# rotated_lamina_stiffness_inplane
-    
-    Return the in-plane stiffness matrix of an orhtropic layer
-    in a reference rotated by an angle theta wrt to the material one.
-    It assumes Voigt notation and plane stress state.
-    (see Reddy 1997, eqn 1.3.71)
-
-    Args:
-        E1: The Young modulus in the material direction 1.
-        E2: The Young modulus in the material direction 2.
-        G23: The in-plane shear modulus.
-        nu12: The in-plane Poisson ratio.
-        theta: The rotation angle from the material to the desired reference system.
-
-    Returns:
-        Q_theta: a 3x3 symmetric ufl matrix giving the stiffness matrix.
-    """
-    c = cos(theta)
-    s = sin(theta)
-    T = as_matrix([[c**2, s**2, -2*s*c],
-                   [s**2, c**2, 2*s*c],
-                   [c*s, -c*s, c**2 - s**2]])
-    # In-plane stiffness matrix of an orhtropic layer in material coordinates
-    nu21 = E2/E1*nu12
-    Q11 = E1/(1-nu12*nu21)
-    Q12 = nu12*E2/(1-nu12*nu21)
-    Q22 = E2/(1-nu12*nu21)
-    Q66 = G12
-    Q16 = 0.
-    Q26= 0.
-    Q = as_matrix([[Q11, Q12, Q16],
-                   [Q12, Q22, Q26],
-                   [Q16, Q26, Q66]])
-    # Rotated matrix in the main reference
-    Q_theta = T*Q*transpose(T)
-
-    return Q_theta
-
-def strain_to_voigt(e):
-    """# strain_to_voigt
-    
-    Returns the pseudo-vector in the Voigt notation associate to a 2x2
-    symmetric strain tensor, according to the following rule (see e.g.https://en.wikipedia.org/wiki/Voigt_notation),
-
-    Args:
-        e: a symmetric 2x2 strain tensor, typically UFL form with shape (2,2)
-
-    Returns:
-        a UFL form with shape (3,1) corresponding to the input tensor in Voigt
-        notation.
-    """
-    return as_vector((e[0,0], e[1,1], 2*e[0,1]))
-
-
-def stress_to_voigt(sigma):
-    """# stress_to_voigt
-    
-    Returns the pseudo-vector in the Voigt notation associate to a 2x2
-    symmetric stress tensor, according to the following rule (see e.g.https://en.wikipedia.org/wiki/Voigt_notation),
-
-    Args:
-        sigma: a symmetric 2x2 stress tensor, typically UFL form with shape
-        (2,2).
-
-    Returns:
-        a UFL form with shape (3,1) corresponding to the input tensor in Voigt notation.
-    """
-    return as_vector((sigma[0,0], sigma[1,1], sigma[0,1]))
-
-
-def strain_from_voigt(e_voigt):
-    """# strain_from_voigt
-    
-    Inverse operation of strain_to_voigt.
-
-    Args:
-        sigma_voigt: UFL form with shape (3,1) corresponding to the strain
-        pseudo-vector in Voigt format
-
-    Returns:
-        a symmetric stress tensor, typically UFL form with shape (2,2)
-    """
-    return as_matrix(((e_voigt[0], e_voigt[2]/2.), (e_voigt[2]/2., e_voigt[1])))
-
-
-def stress_from_voigt(sigma_voigt):
-    """# stress_from_voigt
-    
-    Inverse operation of stress_to_voigt.
-
-    Args:
-        sigma_voigt: UFL form with shape (3,1) corresponding to the stress
-        pseudo-vector in Voigt format.
-
-    Returns:
-        a symmetric stress tensor, typically UFL form with shape (2,2)
-    """
-    return as_matrix(((sigma_voigt[0], sigma_voigt[2]), (sigma_voigt[2], sigma_voigt[1])))
-
-def strain(u):
-    """# strain
-    
-    Calculate strain tensor from inplane displacement vector.
-
-    Args:
-        u: inplane displacement vector fenics function
-
-    Returns:
-        eps: inplane strain fenics tensor function
-    """
-    return sym(grad(u))
-
-def stress(Q, u):
-    """# stress
-    
-    Calculate stress tensor from inplane displacement tensor and inplane stiffness matrix
-
-    Args:
-        Q: 3*3 fenics materix for inplane stiffness
-        u: inplane displacement vector fenics function
-
-    returns:
-        sigma: inplane stress fenics tensor function
-    """
-    return stress_from_voigt(Q*strain_to_voigt(sym(grad(u))))
-
+    val = (1 / (1 + exp(-a*u)))*(1-offset) + offset
+    return project(val, U)
 
 class CoreProcess(torch_fenics.FEniCSModule):
     """# Core class
@@ -217,18 +108,50 @@ class CoreProcess(torch_fenics.FEniCSModule):
         files (dict{'str'}): File paths for saving some results.
     
     """
-    def __init__(self, mesh, load_conditions, applied_load_vectors, displacement_boundaries_sub0, displacement_boundaries_sub1, applied_displacements_sub0, applied_displacements_sub1, material_parameters, files, a):
+    def __init__(self, mesh, w_boundaries, applied_w, rotation_boundaries_sub0, applied_rotation_sub0, rotation_boundaries_sub1, applied_rotation_sub1, material_parameters, files, a):
         super().__init__()
         self.mesh = mesh
-        self.load_conditions = load_conditions
-        self.applied_loadvectors = applied_load_vectors
-        self.displacement_boundaries_sub0 = displacement_boundaries_sub0
-        self.applied_displacements_sub0 = applied_displacements_sub0
-        self.displacement_boundaries_sub1 = displacement_boundaries_sub1
-        self.applied_displacements_sub1 = applied_displacements_sub1
+        self.w_boundaries = w_boundaries
+        self.applied_w = applied_w
+        self.rotation_boundaries_sub0 = rotation_boundaries_sub0
+        self.applied_rotation_sub0 = applied_rotation_sub0
+        self.rotation_boundaries_sub1 = rotation_boundaries_sub1
+        self.applied_rotation_sub1 = applied_rotation_sub1
         self.material_parameters = material_parameters
         self.files = files
         self.a = a
+    
+    # membrane strain energy is
+    def psi_N(self, v, v_t, A):
+        e = sym(grad(v))
+        ev = strain_to_voigt(e)
+        e_t = sym(grad(v_t))
+        ev_t = strain_to_voigt(e_t)
+        Ai = project(A, TensorFunctionSpace(self.mesh, 'CG', 1, shape=(3,3)))
+        return .5*dot(Ai*ev, ev_t)
+
+    # bending strain tensor can be expressed in terms of the rotation field
+    def psi_M(self, theta, theta_t, D):
+        k = sym(grad(theta))
+        kv = strain_to_voigt(k)
+        k_t = sym(grad(theta_t))
+        kv_t = strain_to_voigt(k_t)
+        Di = project(D, TensorFunctionSpace(self.mesh, 'CG', 1, shape=(3,3)))
+        return  .5*dot(Di*kv, kv_t)
+
+    # reduced shear strain energy is
+    def psi_T(self, gamma, gamma_t, Fs):
+        Fi = project(Fs, TensorFunctionSpace(self.mesh, 'CG', 1, shape=(2,2)))
+        return .5*dot(Fi*gamma, gamma_t)
+
+    # Coupling strain energy is
+    def psi_MN(self, theta, v_t, B):
+        k = sym(grad(theta))
+        ki = strain_to_voigt(k)
+        e_t = sym(grad(v_t))# + 0.5*outer(grad(w), grad(w))
+        ei_t = strain_to_voigt(e_t)
+        Bi = project(B, TensorFunctionSpace(self.mesh, 'CG', 1, shape=(3,3)))
+        return dot(Bi*ki, ei_t)
     
     def input_templates(self):
         return Function(FunctionSpace(self.mesh, 'CG', 1)), Function(FunctionSpace(self.mesh, 'CG', 1)), Function(FunctionSpace(self.mesh, 'CG', 1))
@@ -246,65 +169,93 @@ class CoreProcess(torch_fenics.FEniCSModule):
         Returns:
             f: Strain energy
         """
+        bar = tqdm(total=4)
+        bar.set_description('Constracting finite element spaces..')
+        bar.update(1)
+        # Define finite element spaces.
+        # Ist order CG element for the in-plane displacement
+        # 2nd order CG element for the rotation field
+        # 1st order CG element for the bending displacement field
+        # 1st order edge element (Nedelec element) for the reduced shear strain and Lagrange multiplier
 
-        facets = MeshFunction('size_t', self.mesh, 1)
-        facets.set_all(0)
-        for i in range(len(self.load_conditions)):
-            self.load_conditions[i].mark(facets, int(i+1))
-        ds = Measure('ds', subdomain_data=facets)
+        elements = MixedElement([VectorElement("Lagrange", triangle, 1),
+                                VectorElement("Lagrange", triangle, 2),
+                                FiniteElement("Lagrange", triangle, 1),
+                                FiniteElement("N1curl", triangle, 1),
+                                FiniteElement("N1curl", triangle, 1)])
+        U = FunctionSpace(self.mesh, elements)
+
+        u = Function(U)
+        du = TrialFunction(U)
+        ut = TestFunction(U)
+        v, theta, w, R_gamma, p = split(u)
 
         Orient = VectorFunctionSpace(self.mesh, 'CG', 1)
         orient = helmholtz_filter(project(iso_filter(z, e), Orient), Orient)
         orient.rename('Orientation vector field', 'label')
-        theta = project(operators.atan_2(orient[1], orient[0]), FunctionSpace(self.mesh, 'CG', 1))
-        theta.rename('Material axial field', 'label')
-        normrized_orient = project(as_vector((cos(theta), sin(theta))), Orient)
+        phi = project(operators.atan_2(orient[1], orient[0]), FunctionSpace(self.mesh, 'CG', 1))
+        phi.rename('Material axial field', 'label')
+        normrized_orient = project(as_vector((cos(phi), sin(phi))), Orient)
         normrized_orient.rename('NormalizedVectorField', 'label')
+
+        thetas = [np.deg2rad(45), np.deg2rad(-45), phi, np.deg2rad(-45), np.deg2rad(45)]
+        E1 = self.material_parameters['E1']
+        E2 = self.material_parameters['E2']
+        G12 = self.material_parameters['G12']
+        nu12 = self.material_parameters['nu12']
+        G23 = self.material_parameters['G23']
+
+        A_, B_, D_ = laminates.ABD(E1, E2, G12, nu12, [0.5, 0.5, 1, 0.5, 0.5], thetas)
+        Fs = laminates.F(G12, G23, [0.5, 0.5, 1, 0.5, 0.5], thetas)
 
         Density = FunctionSpace(self.mesh, 'CG', 1)
         density = heviside_filter(helmholtz_filter(r, Density), Density, a=self.a)
         density.rename('Relatively density field', 'label')
+        A_ = A_*density
+        B_ = B_*density
+        D_ = D_*density
+        Fs = Fs*density
 
-        V = VectorFunctionSpace(self.mesh, 'CG', 1)
-        v = TrialFunction(V)
-        dv = TestFunction(V)
-        vh = Function(V, name='Displacement vector field')
+        # (non-reduced) shear strain can be expressed in terms of the grad of membrane displacement
+        gamma = grad(w) - theta
 
-        Q = rotated_lamina_stiffness_inplane(
-            self.material_parameters['E1'],
-            self.material_parameters['E2'],
-            self.material_parameters['G12'],
-            self.material_parameters['nu12'],
-            theta
-        )
-        p = 3
-        Q_reduce = Q*density**p
+        # We require that the shear strain equal to the reduced shear strain
+        # We enforce this constraints using Lagrange method with multiplier p
+        L_R = inner_e(gamma - R_gamma, p)
+
+        # Then, total system is
+        bar.set_description('Assembling system..')
+        bar.update(1)
+        F = self.psi_M(theta, theta, D_)*dx + self.psi_N(v, v, A_)*dx + self.psi_T(R_gamma, R_gamma, Fs)*dx + L_R
+        dF = derivative(F, u, ut)
+        J = derivative(dF, u, du)
+        a = derivative(F, u, du)
+        A = assemble(J)
+        b = assemble(dF)
 
         bcs = []
-        for i in range(len(self.displacement_boundaries_sub0)):
-            bcs.append(DirichletBC(V.sub(0), self.applied_displacements_sub0[i], self.displacement_boundaries_sub0[i]))
-        for i in range(len(self.displacement_boundaries_sub1)):
-            bcs.append(DirichletBC(V.sub(1), self.applied_displacements_sub1[i], self.displacement_boundaries_sub1[i]))
+        for i in range(len(self.w_boundaries)):
+            bcs.append(DirichletBC(U.sub(2), self.applied_w[i], self.w_boundaries[i]))
+        for i in range(len(self.rotation_boundaries_sub0)):
+            bcs.append(DirichletBC(U.sub(1).sub(0), self.applied_rotation_sub0[i], self.rotation_boundaries_sub0[i]))
+        for i in range(len(self.rotation_boundaries_sub1)):
+            bcs.append(DirichletBC(U.sub(1).sub(1), self.applied_rotation_sub1[i], self.rotation_boundaries_sub1[i]))
 
-        a = inner(stress(Q_reduce, v), strain(dv))*dx
-        L = dot(self.applied_loadvectors[0], dv)*ds(1)
-        if len(self.applied_loadvectors) > 1:
-            for i in range(len(self.load_conditions)-1):
-                L += dot(self.applied_loadvectors[i+1], dv)*ds(i+2)
-        else:
-            pass
-        solve(a==L, vh, bcs)
-        strain_energy = 0.5*inner(stress(Q_reduce, vh), strain(vh))*dx
-        cost = assemble(strain_energy)
 
-        sigma = project(stress(Q_reduce, vh), TensorFunctionSpace(self.mesh, 'CG', 1))
-        sigma.rename('Stress tensor field', 'label')
-        eps = project(strain(vh), TensorFunctionSpace(self.mesh, 'CG', 1))
-        eps.rename('Strain tensor field', 'label')
+        solver = PETScLUSolver("mumps") 
+        for bc in bcs:
+            bc.apply(A, b)
 
-        self.files['Displacement'].write(vh)
-        self.files['Stress'].write(sigma)
-        self.files['Strain'].write(eps)
+        bar.set_description('Solving system..')
+        bar.update(1)
+        solver.solve(A, u.vector(), b)
+
+        vh, thetah, wh, R_gammah, ph = u.split()
+        cost = assemble(self.psi_M(thetah, thetah, D_)*dx + self.psi_N(vh, vh, A_)*dx + self.psi_T(R_gammah, R_gammah, Fs)*dx)
+        bar.set_description('Solved system..')
+        bar.update(1)
+
+        self.files['Displacement'].write(wh)
         self.files['Orient'].write(orient)
         self.files['Dens'].write(density)
         self.files['Orientpipe'] << normrized_orient
@@ -369,12 +320,12 @@ class Optimizer():
     """
     def __init__(self):
         self.mesh = None
-        self.load_conditions = None
-        self.applied_loadvectors = None
-        self.bcs_0 = None
-        self.bcs_1 = None
-        self.applied_displacements_0 = None
-        self.applied_displacements_1 = None
+        self.w_boundaries = None
+        self.applied_w = None
+        self.rotation_boundaries_sub0 = None
+        self.applied_rotation_sub0 = None
+        self.rotation_boundaries_sub1 = None
+        self.applied_rotation_sub1 = None
         self.material_parameters = None
         self.files = None
         self.target = None
@@ -414,7 +365,7 @@ class Optimizer():
         self.count_vertices = mesh.num_vertices()
         pass
 
-    def set_bcs(self, boundaries_sub0, boundaries_sub1, applied_displacements_sub0, applied_displacements_sub1):
+    def set_bcs(self, w_boundaries, applied_w, rotation_boundaries_sub0, applied_rotation_sub0, rotation_boundaries_sub1, applied_rotation_sub1):
         """# set_bcs
 
         Apply displacement boundaries.
@@ -433,31 +384,12 @@ class Optimizer():
         Returns:
             None
         """
-        self.bcs_0 = boundaries_sub0
-        self.bcs_1 = boundaries_sub1
-        self.applied_displacements_0 = applied_displacements_sub0
-        self.applied_displacements_1 = applied_displacements_sub1
-        pass
-
-    def set_loading(self, boundaries, applied_load):
-        """# set_loading
-
-        Apply loading boundaries.
-
-        Args:
-            boundaries: FEniCS Subdomain instance for loading boundaries.
-
-                            class Loading(SubDomain):
-                                def inside(self, x, on_boundary):
-                                    return x[1] < 0 and on_boundary
-
-            applied_load: list(FEniCS constant vector instace.)
-
-        Returns:
-            None
-        """
-        self.load_conditions = boundaries
-        self.applied_loadvectors = applied_load
+        self.w_boundaries = w_boundaries
+        self.applied_w = applied_w
+        self.rotation_boundaries_sub0 = rotation_boundaries_sub0
+        self.applied_rotation_sub0 = applied_rotation_sub0
+        self.rotation_boundaries_sub1 = rotation_boundaries_sub1
+        self.applied_rotation_sub1 = applied_rotation_sub1
         pass
 
     def set_material(self, material):
@@ -514,12 +446,12 @@ class Optimizer():
         """# Intialize
         """
         self.problem = CoreProcess(self.mesh,
-                                   self.load_conditions,
-                                   self.applied_loadvectors,
-                                   self.bcs_0,
-                                   self.bcs_1,
-                                   self.applied_displacements_0,
-                                   self.applied_displacements_1,
+                                   self.w_boundaries,
+                                   self.applied_w,
+                                   self.rotation_boundaries_sub0,
+                                   self.applied_rotation_sub0,
+                                   self.rotation_boundaries_sub1,
+                                   self.applied_rotation_sub1,
                                    self.material_parameters,
                                    self.files,
                                    self.a)
@@ -530,7 +462,7 @@ class Optimizer():
         """
         constraint = VolumeConstraint(RelativelyDensityResponce(self.mesh))
         solver = nl.opt(nl.LD_MMA, self.count_vertices*3)
-        solver.set_min_objective(self.__template)
+        solver.set_max_objective(self.__template)
         solver.add_inequality_constraint(lambda x, grad: constraint.template(x, grad, self.target), 1e-8)
         #solver.set_min_objective(self.__template, None)
         solver.set_lower_bounds(-1.0)
